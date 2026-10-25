@@ -1,0 +1,155 @@
+# Builds and tests the Windows arm64 MSI and ZIP on GitHub's windows-11-arm runners.
+#
+# Until cryptography 51 is released, the cryptography wheel is built from pyca/cryptography
+# main against the same OpenSSL build that cryptography's own CI uses (pyca/infra), and
+# build.cmd installs the requirements with uv so it can override msal/pyOpenSSL's
+# cryptography<51 cap. See the [TEST ONLY] commit in this branch.
+name: Windows arm64 build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to upload the MSI and ZIP to (leave empty to only build)'
+        required: false
+        default: ''
+  pull_request:
+    paths:
+      - '.github/workflows/WindowsArm64Build.yml'
+      - 'build_scripts/windows/**'
+      - 'src/azure-cli/requirements.py3.windows.txt'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CRYPTOGRAPHY_REF: fcc09adb90945754d005200268a64cd00ed3b271
+
+jobs:
+  cryptography:
+    name: Build cryptography wheel
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+          architecture: arm64
+
+      - name: Download OpenSSL from pyca/infra
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list --repo pyca/infra --workflow build-windows-openssl.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          echo "Using pyca/infra run $run_id"
+          gh run download "$run_id" --repo pyca/infra --name openssl-arm64 --dir "$RUNNER_TEMP/openssl-arm64"
+          echo "OPENSSL_DIR=$RUNNER_TEMP/openssl-arm64" >> "$GITHUB_ENV"
+          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+
+      - name: Build wheel
+        shell: bash
+        run: |
+          python -m pip wheel --no-deps -w wheelhouse \
+            "--config-settings=build-args=--features=pyo3/abi3-py311" \
+            "cryptography @ git+https://github.com/pyca/cryptography@${CRYPTOGRAPHY_REF}"
+          ls wheelhouse
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cryptography-wheel
+          path: wheelhouse/*.whl
+
+  build:
+    name: Build and test ${{ matrix.target }}
+    needs: cryptography
+    runs-on: windows-11-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [msi, zip]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cryptography-wheel
+          path: ${{ runner.temp }}/wheels
+
+      - name: Set up build environment
+        shell: bash
+        run: |
+          # Same as scripts/release/get_version.sh
+          ver=$(grep __version__ src/azure-cli/azure/cli/__main__.py | sed s/' '//g | sed s/'__version__='// | sed s/\"//g)
+          echo "CLI_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "cryptography==$(ls "$RUNNER_TEMP/wheels" | sed -n 's/^cryptography-\([^-]*\)-.*/\1/p')" > "$RUNNER_TEMP/uv-override.txt"
+          cat "$RUNNER_TEMP/uv-override.txt"
+          echo "UV_OVERRIDE=$RUNNER_TEMP/uv-override.txt" >> "$GITHUB_ENV"
+          echo "UV_FIND_LINKS=$RUNNER_TEMP/wheels" >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.target }}
+        shell: cmd
+        env:
+          ARCH: arm64
+          TARGET: ${{ matrix.target }}
+          AZURE_CLI_BUILD_USE_UV: '1'
+        run: build_scripts\windows\scripts\build.cmd
+
+      # Lay out the files the way the Azure Pipelines test jobs expect them.
+      - name: Prepare test inputs
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts/${{ matrix.target }}" "$RUNNER_TEMP/artifacts/metadata"
+          cp build_scripts/windows/out/* "$RUNNER_TEMP/artifacts/${{ matrix.target }}/"
+          echo "$CLI_VERSION" > "$RUNNER_TEMP/artifacts/metadata/version"
+
+      - name: Test MSI installation
+        if: matrix.target == 'msi'
+        shell: powershell
+        env:
+          SYSTEM_ARTIFACTSDIRECTORY: ${{ runner.temp }}\artifacts
+          PLATFORM: arm64
+        run: build_scripts\windows\scripts\test_msi_installation.ps1
+
+      - name: Test ZIP installation
+        if: matrix.target == 'zip'
+        shell: powershell
+        env:
+          SYSTEM_ARTIFACTSDIRECTORY: ${{ runner.temp }}\artifacts
+        run: build_scripts\windows\scripts\test_zip_installation.ps1
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}-arm64
+          path: build_scripts/windows/out/
+
+  publish:
+    name: Upload to release
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: '*-arm64'
+          path: artifacts
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          mkdir release
+          cp "artifacts/msi-arm64/Microsoft Azure CLI.msi" "release/azure-cli-${RELEASE_TAG#v}.msi"
+          cp "artifacts/zip-arm64/Microsoft Azure CLI.zip" "release/azure-cli-${RELEASE_TAG#v}.zip"
+          cd release
+          sha256sum *.msi *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber *.msi *.zip SHA256SUMS.txt

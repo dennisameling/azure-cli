@@ -157,7 +157,13 @@ for %%a in (%CLI_SRC%\azure-cli %CLI_SRC%\azure-cli-core %CLI_SRC%\azure-cli-tel
    popd
 )
 
-%BUILDING_DIR%\python.exe -Im pip install --no-warn-script-location --requirement %CLI_SRC%\azure-cli\requirements.py3.windows.txt
+REM TEMPORARY (arm64 test only, do not upstream): msal/pyOpenSSL cap cryptography<51, which pip cannot override.
+REM uv picks up the override file from UV_OVERRIDE and the local cryptography wheel from UV_FIND_LINKS.
+if defined AZURE_CLI_BUILD_USE_UV (
+    uv pip install --python %BUILDING_DIR%\python.exe --requirement %CLI_SRC%\azure-cli\requirements.py3.windows.txt
+) else (
+    %BUILDING_DIR%\python.exe -Im pip install --no-warn-script-location --requirement %CLI_SRC%\azure-cli\requirements.py3.windows.txt
+)
 if %errorlevel% neq 0 goto ERROR
 
 REM Check azure.cli can be executed. This also prints the Python version.

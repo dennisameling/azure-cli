@@ -52,7 +52,7 @@ Get-Package -Provider Programs -IncludeWindowsInstaller -Name "Microsoft Azure C
 
 # We can't restart the current shell in CI to refresh PATH, so use absolute path.
 # If we can find a way to refresh PATH in the same shell session, we can directly call az.
-if ($env:PLATFORM -eq 'x64')  {
+if ($env:PLATFORM -in 'x64', 'arm64')  {
     $az_full_path = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
 } else {
     $az_full_path = "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"

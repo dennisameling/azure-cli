@@ -1,0 +1,129 @@
+# Builds and tests the Windows x86 and x64 MSIs with WiX v7 on GitHub's Windows runners.
+#
+# Besides the fresh install that test_msi_installation.ps1 covers, this checks that the MSI
+# upgrades an install of the previous release (built with WiX v3) and that uninstalling it
+# cleans up after itself.
+name: Windows MSI build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/WindowsMsiBuild.yml'
+      - 'build_scripts/windows/**'
+      - 'src/azure-cli/requirements.py3.windows.txt'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Release to upgrade from, i.e. the one before the version in src/azure-cli/azure/cli/__main__.py
+  PREVIOUS_VERSION: 2.90.0
+
+jobs:
+  build:
+    name: Build and test ${{ matrix.arch }} MSI
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86, x64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up build environment
+        shell: bash
+        run: |
+          # Same as scripts/release/get_version.sh
+          ver=$(grep __version__ src/azure-cli/azure/cli/__main__.py | sed s/' '//g | sed s/'__version__='// | sed s/\"//g)
+          echo "CLI_VERSION=$ver" >> "$GITHUB_ENV"
+
+      - name: Build MSI
+        shell: cmd
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: msi
+          # The owner of this fork accepted the WiX v7 OSMF EULA (https://wixtoolset.org/osmf/).
+          AcceptEula: wix7
+        run: build_scripts\windows\scripts\build.cmd
+
+      # Lay out the files the way the Azure Pipelines test jobs expect them.
+      - name: Prepare test inputs
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts/msi" "$RUNNER_TEMP/artifacts/metadata"
+          cp "build_scripts/windows/out/Microsoft Azure CLI.msi" "$RUNNER_TEMP/artifacts/msi/"
+          echo "$CLI_VERSION" > "$RUNNER_TEMP/artifacts/metadata/version"
+
+      - name: Test upgrade from ${{ env.PREVIOUS_VERSION }}
+        shell: powershell
+        env:
+          PLATFORM: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Invoke-Msiexec($arguments) {
+              Write-Output "Calling: msiexec.exe $arguments"
+              $p = Start-Process msiexec.exe -ArgumentList $arguments -Wait -NoNewWindow -PassThru
+              if ($p.ExitCode -ne 0) { throw "msiexec exited with $($p.ExitCode)" }
+          }
+
+          # Replace the runner's preinstalled Azure CLI with the previous release of the same architecture.
+          Get-Package -Provider Programs -IncludeWindowsInstaller -Name 'Microsoft Azure CLI*' | Uninstall-Package
+          $suffix = if ($env:PLATFORM -eq 'x64') { '-x64' } else { '' }
+          curl.exe -fsSL -o "$env:RUNNER_TEMP\previous.msi" "https://azcliprod.blob.core.windows.net/msi/azure-cli-$env:PREVIOUS_VERSION$suffix.msi"
+          Invoke-Msiexec "/i `"$env:RUNNER_TEMP\previous.msi`" /qn /norestart /l*v `"$env:RUNNER_TEMP\previous_install.log`""
+          Get-Package -Provider Programs -IncludeWindowsInstaller -Name 'Microsoft Azure CLI*' | Format-List Name, Version
+
+          Invoke-Msiexec "/i `"$env:RUNNER_TEMP\artifacts\msi\Microsoft Azure CLI.msi`" /qn /norestart /l*v `"$env:RUNNER_TEMP\upgrade.log`""
+          $packages = @(Get-Package -Provider Programs -IncludeWindowsInstaller -Name 'Microsoft Azure CLI*')
+          $packages | Format-List Name, Version
+          if ($packages.Count -ne 1 -or $packages[0].Version -ne $env:CLI_VERSION) {
+              throw "Expected exactly one Azure CLI $env:CLI_VERSION install after the upgrade"
+          }
+
+          $programFiles = if ($env:PLATFORM -eq 'x64') { $env:ProgramFiles } else { ${env:ProgramFiles(x86)} }
+          & "$programFiles\Microsoft SDKs\Azure\CLI2\wbin\az.cmd" version
+          if ($LASTEXITCODE -ne 0) { throw "az version failed" }
+
+      - name: Test MSI installation
+        shell: powershell
+        env:
+          SYSTEM_ARTIFACTSDIRECTORY: ${{ runner.temp }}\artifacts
+          PLATFORM: ${{ matrix.arch }}
+        run: build_scripts\windows\scripts\test_msi_installation.ps1
+
+      - name: Test uninstall
+        shell: powershell
+        env:
+          PLATFORM: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-Package -Provider Programs -IncludeWindowsInstaller -Name 'Microsoft Azure CLI*' | Uninstall-Package
+          if (Get-Package -Provider Programs -IncludeWindowsInstaller -Name 'Microsoft Azure CLI*' -ErrorAction SilentlyContinue) {
+              throw "Azure CLI is still installed"
+          }
+          $programFiles = if ($env:PLATFORM -eq 'x64') { $env:ProgramFiles } else { ${env:ProgramFiles(x86)} }
+          $installDir = "$programFiles\Microsoft SDKs\Azure\CLI2"
+          if (Test-Path $installDir) {
+              Get-ChildItem -Recurse $installDir | Select-Object -First 20 FullName
+              throw "$installDir still exists"
+          }
+          $machinePath = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
+          if ($machinePath -like '*Microsoft SDKs\Azure\CLI2\wbin*') { throw "PATH still contains the CLI: $machinePath" }
+          Write-Output 'Uninstall removed the install directory and the PATH entry.'
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: msi-${{ matrix.arch }}
+          path: build_scripts/windows/out/Microsoft Azure CLI.msi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: msiexec-logs-${{ matrix.arch }}
+          path: ${{ runner.temp }}/*.log
+          if-no-files-found: ignore

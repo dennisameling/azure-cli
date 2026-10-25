@@ -110,7 +110,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/artifacts/${{ matrix.target }}" "$RUNNER_TEMP/artifacts/metadata"
-          cp build_scripts/windows/out/* "$RUNNER_TEMP/artifacts/${{ matrix.target }}/"
+          cp "build_scripts/windows/out/Microsoft Azure CLI.${{ matrix.target }}" "$RUNNER_TEMP/artifacts/${{ matrix.target }}/"
           echo "$CLI_VERSION" > "$RUNNER_TEMP/artifacts/metadata/version"
 
       - name: Test MSI installation
@@ -131,7 +131,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.target }}-arm64
-          path: build_scripts/windows/out/
+          path: build_scripts/windows/out/Microsoft Azure CLI.${{ matrix.target }}
 
   publish:
     name: Upload to release

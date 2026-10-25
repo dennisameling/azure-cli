@@ -70,18 +70,25 @@ jobs:
               $p = Start-Process msiexec.exe -ArgumentList $arguments -Wait -NoNewWindow -PassThru
               if ($p.ExitCode -ne 0) { throw "msiexec exited with $($p.ExitCode)" }
           }
+          function Get-AzureCliProducts {
+              Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+                  Where-Object { $_.DisplayName -like 'Microsoft Azure CLI*' }
+          }
 
           # Replace the runner's preinstalled Azure CLI with the previous release of the same architecture.
-          Get-Package -Provider Programs -IncludeWindowsInstaller -Name 'Microsoft Azure CLI*' | Uninstall-Package
+          foreach ($product in Get-AzureCliProducts) {
+              Invoke-Msiexec "/x $($product.PSChildName) /qn /norestart /l*v `"$env:RUNNER_TEMP\preinstalled_uninstall.log`""
+          }
+          if (Get-AzureCliProducts) { throw 'The preinstalled Azure CLI is still installed' }
           $suffix = if ($env:PLATFORM -eq 'x64') { '-x64' } else { '' }
           curl.exe -fsSL -o "$env:RUNNER_TEMP\previous.msi" "https://azcliprod.blob.core.windows.net/msi/azure-cli-$env:PREVIOUS_VERSION$suffix.msi"
           Invoke-Msiexec "/i `"$env:RUNNER_TEMP\previous.msi`" /qn /norestart /l*v `"$env:RUNNER_TEMP\previous_install.log`""
-          Get-Package -Provider Programs -IncludeWindowsInstaller -Name 'Microsoft Azure CLI*' | Format-List Name, Version
+          Get-AzureCliProducts | Format-List DisplayName, DisplayVersion
 
           Invoke-Msiexec "/i `"$env:RUNNER_TEMP\artifacts\msi\Microsoft Azure CLI.msi`" /qn /norestart /l*v `"$env:RUNNER_TEMP\upgrade.log`""
-          $packages = @(Get-Package -Provider Programs -IncludeWindowsInstaller -Name 'Microsoft Azure CLI*')
-          $packages | Format-List Name, Version
-          if ($packages.Count -ne 1 -or $packages[0].Version -ne $env:CLI_VERSION) {
+          $products = @(Get-AzureCliProducts)
+          $products | Format-List DisplayName, DisplayVersion
+          if ($products.Count -ne 1 -or $products[0].DisplayVersion -ne $env:CLI_VERSION) {
               throw "Expected exactly one Azure CLI $env:CLI_VERSION install after the upgrade"
           }
 
@@ -102,8 +109,14 @@ jobs:
           PLATFORM: ${{ matrix.arch }}
         run: |
           $ErrorActionPreference = 'Stop'
-          Get-Package -Provider Programs -IncludeWindowsInstaller -Name 'Microsoft Azure CLI*' | Uninstall-Package
-          if (Get-Package -Provider Programs -IncludeWindowsInstaller -Name 'Microsoft Azure CLI*' -ErrorAction SilentlyContinue) {
+          $products = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+              Where-Object { $_.DisplayName -like 'Microsoft Azure CLI*' })
+          $products | Format-List DisplayName, DisplayVersion
+          if ($products.Count -ne 1) { throw "Expected exactly one Azure CLI install before uninstalling" }
+          $p = Start-Process msiexec.exe -ArgumentList "/x $($products[0].PSChildName) /qn /norestart /l*v `"$env:RUNNER_TEMP\uninstall.log`"" -Wait -NoNewWindow -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec exited with $($p.ExitCode)" }
+          if (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+              Where-Object { $_.DisplayName -like 'Microsoft Azure CLI*' }) {
               throw "Azure CLI is still installed"
           }
           $programFiles = if ($env:PLATFORM -eq 'x64') { $env:ProgramFiles } else { ${env:ProgramFiles(x86)} }

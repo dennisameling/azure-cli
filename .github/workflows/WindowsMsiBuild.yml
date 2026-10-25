@@ -83,8 +83,9 @@ jobs:
           # Baseline for the uninstall test below: what an uninstall of a WiX v3-built MSI leaves behind.
           foreach ($dir in "$env:ProgramFiles\Microsoft SDKs\Azure\CLI2", "${env:ProgramFiles(x86)}\Microsoft SDKs\Azure\CLI2") {
               if (Test-Path $dir) {
-                  Write-Output "::warning::$dir is left behind after uninstalling the preinstalled (WiX v3) Azure CLI"
-                  Get-ChildItem -Force -Recurse $dir | Select-Object -First 20 FullName, Attributes | Format-Table -AutoSize
+                  $leftovers = @(Get-ChildItem -Force -Recurse -File $dir)
+                  $outsidePycache = @($leftovers | Where-Object { $_.Directory.Name -ne '__pycache__' }).Count
+                  Write-Output "::warning::Uninstalling the preinstalled (WiX v3) Azure CLI left $dir with $($leftovers.Count) files, $outsidePycache outside __pycache__"
               }
           }
           $suffix = if ($env:PLATFORM -eq 'x64') { '-x64' } else { '' }
@@ -131,8 +132,15 @@ jobs:
           $programFiles = if ($env:PLATFORM -eq 'x64') { $env:ProgramFiles } else { ${env:ProgramFiles(x86)} }
           $installDir = "$programFiles\Microsoft SDKs\Azure\CLI2"
           if (Test-Path $installDir) {
-              Get-ChildItem -Force -Recurse $installDir | Select-Object -First 20 FullName, Attributes | Format-Table -AutoSize
-              throw "$installDir still exists"
+              # pip is shipped as .py sources, so running it (e.g. `az extension add`) writes __pycache__ files the MSI
+              # doesn't know about. WiX v3-built MSIs leave those behind too (see the baseline in the upgrade step).
+              $leftovers = @(Get-ChildItem -Force -Recurse -File $installDir)
+              $unexpected = @($leftovers | Where-Object { $_.Directory.Name -ne '__pycache__' })
+              if ($unexpected) {
+                  $unexpected | Select-Object -First 20 FullName | Format-Table -AutoSize
+                  throw "Uninstall left $($unexpected.Count) unexpected files in $installDir"
+              }
+              Write-Output "::warning::Uninstall left $installDir with $($leftovers.Count) runtime-generated __pycache__ files (same as WiX v3 builds)"
           }
           $machinePath = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
           if ($machinePath -like '*Microsoft SDKs\Azure\CLI2\wbin*') { throw "PATH still contains the CLI: $machinePath" }

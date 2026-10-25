@@ -1,0 +1,142 @@
+# Builds and tests the Windows x86 and x64 MSIs with WiX v7 on GitHub's Windows runners.
+#
+# Besides the fresh install that test_msi_installation.ps1 covers, this checks that the MSI
+# upgrades an install of the previous release (built with WiX v3) and that uninstalling it
+# cleans up after itself.
+name: Windows MSI build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/WindowsMsiBuild.yml'
+      - 'build_scripts/windows/**'
+      - 'src/azure-cli/requirements.py3.windows.txt'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test ${{ matrix.arch }} MSI
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86, x64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up build environment
+        shell: bash
+        run: |
+          # Same as scripts/release/get_version.sh
+          ver=$(grep __version__ src/azure-cli/azure/cli/__main__.py | sed s/' '//g | sed s/'__version__='// | sed s/\"//g)
+          echo "CLI_VERSION=$ver" >> "$GITHUB_ENV"
+
+      - name: Build MSI
+        shell: cmd
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: msi
+          # The owner of this fork accepted the WiX v7 OSMF EULA (https://wixtoolset.org/osmf/).
+          AcceptEula: wix7
+        run: build_scripts\windows\scripts\build.cmd
+
+      # Lay out the files the way the Azure Pipelines test jobs expect them.
+      - name: Prepare test inputs
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts/msi" "$RUNNER_TEMP/artifacts/metadata"
+          cp "build_scripts/windows/out/Microsoft Azure CLI.msi" "$RUNNER_TEMP/artifacts/msi/"
+          echo "$CLI_VERSION" > "$RUNNER_TEMP/artifacts/metadata/version"
+
+      # Baseline for the uninstall test below: what an uninstall of a WiX v3-built MSI leaves behind.
+      # test_msi_upgrade.ps1 would remove the preinstalled CLI too, but without measuring this.
+      - name: Uninstall preinstalled Azure CLI
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $products = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+              Where-Object { $_.DisplayName -like 'Microsoft Azure CLI*' }
+          foreach ($product in $products) {
+              Write-Output "Uninstalling $($product.DisplayName) $($product.DisplayVersion)"
+              $p = Start-Process msiexec.exe -ArgumentList "/x $($product.PSChildName) /qn /norestart /l*v `"$env:RUNNER_TEMP\preinstalled_uninstall.log`"" -Wait -NoNewWindow -PassThru
+              if ($p.ExitCode -ne 0) { throw "msiexec exited with $($p.ExitCode)" }
+          }
+          foreach ($dir in "$env:ProgramFiles\Microsoft SDKs\Azure\CLI2", "${env:ProgramFiles(x86)}\Microsoft SDKs\Azure\CLI2") {
+              if (Test-Path $dir) {
+                  $leftovers = @(Get-ChildItem -Force -Recurse -File $dir)
+                  $outsidePycache = @($leftovers | Where-Object { $_.Directory.Name -ne '__pycache__' }).Count
+                  Write-Output "::warning::Uninstalling the preinstalled (WiX v3) Azure CLI left $dir with $($leftovers.Count) files, $outsidePycache outside __pycache__"
+              }
+          }
+
+      - name: Test upgrade from the previous release
+        shell: powershell
+        env:
+          SYSTEM_ARTIFACTSDIRECTORY: ${{ runner.temp }}\artifacts
+          PLATFORM: ${{ matrix.arch }}
+          # The script writes its msiexec logs to TEMP; keep them where the log upload below finds them.
+          TEMP: ${{ runner.temp }}
+        run: |
+          build_scripts\windows\scripts\test_msi_upgrade.ps1
+          # The script prepends the CLI to PATH with an Azure Pipelines logging command; do the same for Actions.
+          $programFiles = if ($env:PLATFORM -eq 'x64') { $env:ProgramFiles } else { ${env:ProgramFiles(x86)} }
+          Add-Content $env:GITHUB_PATH "$programFiles\Microsoft SDKs\Azure\CLI2\wbin"
+
+      - name: Test MSI installation
+        shell: powershell
+        env:
+          SYSTEM_ARTIFACTSDIRECTORY: ${{ runner.temp }}\artifacts
+          PLATFORM: ${{ matrix.arch }}
+        run: build_scripts\windows\scripts\test_msi_installation.ps1
+
+      - name: Test uninstall
+        shell: powershell
+        env:
+          PLATFORM: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $products = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+              Where-Object { $_.DisplayName -like 'Microsoft Azure CLI*' })
+          $products | Format-List DisplayName, DisplayVersion
+          if ($products.Count -ne 1) { throw "Expected exactly one Azure CLI install before uninstalling" }
+          $p = Start-Process msiexec.exe -ArgumentList "/x $($products[0].PSChildName) /qn /norestart /l*v `"$env:RUNNER_TEMP\uninstall.log`"" -Wait -NoNewWindow -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec exited with $($p.ExitCode)" }
+          if (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+              Where-Object { $_.DisplayName -like 'Microsoft Azure CLI*' }) {
+              throw "Azure CLI is still installed"
+          }
+          $programFiles = if ($env:PLATFORM -eq 'x64') { $env:ProgramFiles } else { ${env:ProgramFiles(x86)} }
+          $installDir = "$programFiles\Microsoft SDKs\Azure\CLI2"
+          if (Test-Path $installDir) {
+              # pip is shipped as .py sources, so running it (e.g. `az extension add`) writes __pycache__ files the MSI
+              # doesn't know about. WiX v3-built MSIs leave those behind too (see the baseline in the upgrade step).
+              $leftovers = @(Get-ChildItem -Force -Recurse -File $installDir)
+              $unexpected = @($leftovers | Where-Object { $_.Directory.Name -ne '__pycache__' })
+              if ($unexpected) {
+                  $unexpected | Select-Object -First 20 FullName | Format-Table -AutoSize
+                  throw "Uninstall left $($unexpected.Count) unexpected files in $installDir"
+              }
+              Write-Output "::warning::Uninstall left $installDir with $($leftovers.Count) runtime-generated __pycache__ files (same as WiX v3 builds)"
+          }
+          $machinePath = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
+          if ($machinePath -like '*Microsoft SDKs\Azure\CLI2\wbin*') { throw "PATH still contains the CLI: $machinePath" }
+          Write-Output 'Uninstall removed all installed files and the PATH entry.'
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: msi-${{ matrix.arch }}
+          path: build_scripts/windows/out/Microsoft Azure CLI.msi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: msiexec-logs-${{ matrix.arch }}
+          path: ${{ runner.temp }}/*.log
+          if-no-files-found: ignore

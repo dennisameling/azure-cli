@@ -13,7 +13,7 @@ if "%CLI_VERSION%"=="" (
     echo Please set the CLI_VERSION environment variable, e.g. 2.0.13
     goto ERROR
 )
-@REM ARCH can be x86 or x64
+@REM ARCH can be x86, x64 or arm64
 if "%ARCH%"=="" (
     set ARCH=x86
 )
@@ -26,13 +26,16 @@ if "%ARCH%"=="x86" (
     set PYTHON_ARCH=win32
 ) else if "%ARCH%"=="x64" (
     set PYTHON_ARCH=amd64
+) else if "%ARCH%"=="arm64" (
+    set PYTHON_ARCH=arm64
 ) else (
-    echo Please set ARCH to "x86" or "x64"
+    echo Please set ARCH to "x86", "x64" or "arm64"
     goto ERROR
 )
 set PYTHON_VERSION=3.14.8
 
-set WIX_DOWNLOAD_URL="https://azurecliprod.blob.core.windows.net/msi/wix310-binaries-mirror.zip"
+REM WiX 3.14+ is required to build arm64 MSIs
+set WIX_DOWNLOAD_URL="https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip"
 set PYTHON_DOWNLOAD_URL="https://www.python.org/ftp/python/%PYTHON_VERSION%/python-%PYTHON_VERSION%-embed-%PYTHON_ARCH%.zip"
 
 REM https://pip.pypa.io/en/stable/installation/#get-pip-py
@@ -85,9 +88,9 @@ if "%TARGET%" == "msi" (
         mkdir %WIX_DIR%
         pushd %WIX_DIR%
         echo Downloading Wix.
-        curl --output wix-archive.zip %WIX_DOWNLOAD_URL%
+        curl -L --output wix-archive.zip %WIX_DOWNLOAD_URL%
         unzip wix-archive.zip
-        if %errorlevel% neq 0 goto ERROR
+        if !errorlevel! neq 0 goto ERROR
         del wix-archive.zip
         echo Wix downloaded and extracted successfully.
         popd
@@ -106,7 +109,7 @@ if not exist %PYTHON_DIR% (
     echo Downloading Python
     curl --output python-archive.zip %PYTHON_DOWNLOAD_URL%
     unzip python-archive.zip
-    if %errorlevel% neq 0 goto ERROR
+    if !errorlevel! neq 0 goto ERROR
     del python-archive.zip
     echo Python downloaded and extracted successfully
 
@@ -150,11 +153,17 @@ set CLI_SRC=%REPO_ROOT%\src
 for %%a in (%CLI_SRC%\azure-cli %CLI_SRC%\azure-cli-core %CLI_SRC%\azure-cli-telemetry) do (
    pushd %%a
    %BUILDING_DIR%\python.exe -Im pip install --no-warn-script-location --no-cache-dir --no-deps .
-   if %errorlevel% neq 0 goto ERROR
+   if !errorlevel! neq 0 goto ERROR
    popd
 )
 
-%BUILDING_DIR%\python.exe -Im pip install --no-warn-script-location --requirement %CLI_SRC%\azure-cli\requirements.py3.windows.txt
+REM TEMPORARY (arm64 test only, do not upstream): msal/pyOpenSSL cap cryptography<51, which pip cannot override.
+REM uv picks up the override file from UV_OVERRIDE and the local cryptography wheel from UV_FIND_LINKS.
+if defined AZURE_CLI_BUILD_USE_UV (
+    uv pip install --python %BUILDING_DIR%\python.exe --requirement %CLI_SRC%\azure-cli\requirements.py3.windows.txt
+) else (
+    %BUILDING_DIR%\python.exe -Im pip install --no-warn-script-location --requirement %CLI_SRC%\azure-cli\requirements.py3.windows.txt
+)
 if %errorlevel% neq 0 goto ERROR
 
 REM Check azure.cli can be executed. This also prints the Python version.

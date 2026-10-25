@@ -80,6 +80,13 @@ jobs:
               Invoke-Msiexec "/x $($product.PSChildName) /qn /norestart /l*v `"$env:RUNNER_TEMP\preinstalled_uninstall.log`""
           }
           if (Get-AzureCliProducts) { throw 'The preinstalled Azure CLI is still installed' }
+          # Baseline for the uninstall test below: what an uninstall of a WiX v3-built MSI leaves behind.
+          foreach ($dir in "$env:ProgramFiles\Microsoft SDKs\Azure\CLI2", "${env:ProgramFiles(x86)}\Microsoft SDKs\Azure\CLI2") {
+              if (Test-Path $dir) {
+                  Write-Output "::warning::$dir is left behind after uninstalling the preinstalled (WiX v3) Azure CLI"
+                  Get-ChildItem -Force -Recurse $dir | Select-Object -First 20 FullName, Attributes | Format-Table -AutoSize
+              }
+          }
           $suffix = if ($env:PLATFORM -eq 'x64') { '-x64' } else { '' }
           curl.exe -fsSL -o "$env:RUNNER_TEMP\previous.msi" "https://azcliprod.blob.core.windows.net/msi/azure-cli-$env:PREVIOUS_VERSION$suffix.msi"
           Invoke-Msiexec "/i `"$env:RUNNER_TEMP\previous.msi`" /qn /norestart /l*v `"$env:RUNNER_TEMP\previous_install.log`""
@@ -95,6 +102,8 @@ jobs:
           $programFiles = if ($env:PLATFORM -eq 'x64') { $env:ProgramFiles } else { ${env:ProgramFiles(x86)} }
           & "$programFiles\Microsoft SDKs\Azure\CLI2\wbin\az.cmd" version
           if ($LASTEXITCODE -ne 0) { throw "az version failed" }
+          # test_msi_installation.ps1 starts with `az --version`, expecting a preinstalled CLI on PATH like on the ADO agents.
+          Add-Content $env:GITHUB_PATH "$programFiles\Microsoft SDKs\Azure\CLI2\wbin"
 
       - name: Test MSI installation
         shell: powershell
@@ -122,7 +131,7 @@ jobs:
           $programFiles = if ($env:PLATFORM -eq 'x64') { $env:ProgramFiles } else { ${env:ProgramFiles(x86)} }
           $installDir = "$programFiles\Microsoft SDKs\Azure\CLI2"
           if (Test-Path $installDir) {
-              Get-ChildItem -Recurse $installDir | Select-Object -First 20 FullName
+              Get-ChildItem -Force -Recurse $installDir | Select-Object -First 20 FullName, Attributes | Format-Table -AutoSize
               throw "$installDir still exists"
           }
           $machinePath = [Environment]::GetEnvironmentVariable('PATH', 'Machine')

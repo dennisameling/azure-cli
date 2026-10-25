@@ -20,10 +20,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Release to upgrade from, i.e. the one before the version in src/azure-cli/azure/cli/__main__.py
-  PREVIOUS_VERSION: 2.90.0
-
 jobs:
   build:
     name: Build and test ${{ matrix.arch }} MSI
@@ -59,28 +55,19 @@ jobs:
           cp "build_scripts/windows/out/Microsoft Azure CLI.msi" "$RUNNER_TEMP/artifacts/msi/"
           echo "$CLI_VERSION" > "$RUNNER_TEMP/artifacts/metadata/version"
 
-      - name: Test upgrade from ${{ env.PREVIOUS_VERSION }}
+      # Baseline for the uninstall test below: what an uninstall of a WiX v3-built MSI leaves behind.
+      # test_msi_upgrade.ps1 would remove the preinstalled CLI too, but without measuring this.
+      - name: Uninstall preinstalled Azure CLI
         shell: powershell
-        env:
-          PLATFORM: ${{ matrix.arch }}
         run: |
           $ErrorActionPreference = 'Stop'
-          function Invoke-Msiexec($arguments) {
-              Write-Output "Calling: msiexec.exe $arguments"
-              $p = Start-Process msiexec.exe -ArgumentList $arguments -Wait -NoNewWindow -PassThru
+          $products = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+              Where-Object { $_.DisplayName -like 'Microsoft Azure CLI*' }
+          foreach ($product in $products) {
+              Write-Output "Uninstalling $($product.DisplayName) $($product.DisplayVersion)"
+              $p = Start-Process msiexec.exe -ArgumentList "/x $($product.PSChildName) /qn /norestart /l*v `"$env:RUNNER_TEMP\preinstalled_uninstall.log`"" -Wait -NoNewWindow -PassThru
               if ($p.ExitCode -ne 0) { throw "msiexec exited with $($p.ExitCode)" }
           }
-          function Get-AzureCliProducts {
-              Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
-                  Where-Object { $_.DisplayName -like 'Microsoft Azure CLI*' }
-          }
-
-          # Replace the runner's preinstalled Azure CLI with the previous release of the same architecture.
-          foreach ($product in Get-AzureCliProducts) {
-              Invoke-Msiexec "/x $($product.PSChildName) /qn /norestart /l*v `"$env:RUNNER_TEMP\preinstalled_uninstall.log`""
-          }
-          if (Get-AzureCliProducts) { throw 'The preinstalled Azure CLI is still installed' }
-          # Baseline for the uninstall test below: what an uninstall of a WiX v3-built MSI leaves behind.
           foreach ($dir in "$env:ProgramFiles\Microsoft SDKs\Azure\CLI2", "${env:ProgramFiles(x86)}\Microsoft SDKs\Azure\CLI2") {
               if (Test-Path $dir) {
                   $leftovers = @(Get-ChildItem -Force -Recurse -File $dir)
@@ -88,22 +75,18 @@ jobs:
                   Write-Output "::warning::Uninstalling the preinstalled (WiX v3) Azure CLI left $dir with $($leftovers.Count) files, $outsidePycache outside __pycache__"
               }
           }
-          $suffix = if ($env:PLATFORM -eq 'x64') { '-x64' } else { '' }
-          curl.exe -fsSL -o "$env:RUNNER_TEMP\previous.msi" "https://azcliprod.blob.core.windows.net/msi/azure-cli-$env:PREVIOUS_VERSION$suffix.msi"
-          Invoke-Msiexec "/i `"$env:RUNNER_TEMP\previous.msi`" /qn /norestart /l*v `"$env:RUNNER_TEMP\previous_install.log`""
-          Get-AzureCliProducts | Format-List DisplayName, DisplayVersion
 
-          Invoke-Msiexec "/i `"$env:RUNNER_TEMP\artifacts\msi\Microsoft Azure CLI.msi`" /qn /norestart /l*v `"$env:RUNNER_TEMP\upgrade.log`""
-          $products = @(Get-AzureCliProducts)
-          $products | Format-List DisplayName, DisplayVersion
-          if ($products.Count -ne 1 -or $products[0].DisplayVersion -ne $env:CLI_VERSION) {
-              throw "Expected exactly one Azure CLI $env:CLI_VERSION install after the upgrade"
-          }
-
+      - name: Test upgrade from the previous release
+        shell: powershell
+        env:
+          SYSTEM_ARTIFACTSDIRECTORY: ${{ runner.temp }}\artifacts
+          PLATFORM: ${{ matrix.arch }}
+          # The script writes its msiexec logs to TEMP; keep them where the log upload below finds them.
+          TEMP: ${{ runner.temp }}
+        run: |
+          build_scripts\windows\scripts\test_msi_upgrade.ps1
+          # The script prepends the CLI to PATH with an Azure Pipelines logging command; do the same for Actions.
           $programFiles = if ($env:PLATFORM -eq 'x64') { $env:ProgramFiles } else { ${env:ProgramFiles(x86)} }
-          & "$programFiles\Microsoft SDKs\Azure\CLI2\wbin\az.cmd" version
-          if ($LASTEXITCODE -ne 0) { throw "az version failed" }
-          # test_msi_installation.ps1 starts with `az --version`, expecting a preinstalled CLI on PATH like on the ADO agents.
           Add-Content $env:GITHUB_PATH "$programFiles\Microsoft SDKs\Azure\CLI2\wbin"
 
       - name: Test MSI installation
